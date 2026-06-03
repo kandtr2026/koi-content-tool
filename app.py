@@ -1,69 +1,68 @@
 import streamlit as st
-import json
 import os
 import time
 import tempfile
 from datetime import datetime
 import google.generativeai as genai
+from supabase import create_client
 
-# ── Config ──────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyCLP4-z7ZojkV6XUCb7yAsUJHdGLzK0Fjw"
-CHANNELS_FILE = "channels.json"
-USAGE_FILE = "usage_log.json"
+# ── Config ───────────────────────────────────────────────────────────────────
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
 genai.configure(api_key=GEMINI_API_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="Content Tool", page_icon="🎬", layout="wide")
 
 # ── Data helpers ─────────────────────────────────────────────────────────────
 def load_channels():
-    if os.path.exists(CHANNELS_FILE):
-        with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+    res = supabase.table("channels").select("*").order("last_used", desc=True, nullsfirst=False).execute()
+    return res.data or []
 
-def save_channels(channels):
-    with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
-        json.dump(channels, f, ensure_ascii=False, indent=2)
+def add_channel(name, platform, language, context):
+    supabase.table("channels").insert({
+        "name": name,
+        "platform": platform,
+        "language": language,
+        "context": context
+    }).execute()
 
-def load_usage():
-    if os.path.exists(USAGE_FILE):
-        with open(USAGE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def delete_channel(name):
+    supabase.table("channels").delete().eq("name", name).execute()
 
-def save_usage(usage):
-    with open(USAGE_FILE, "w", encoding="utf-8") as f:
-        json.dump(usage, f, ensure_ascii=False, indent=2)
-
-def record_usage(channel_name):
-    usage = load_usage()
-    usage[channel_name] = datetime.now().isoformat()
-    save_usage(usage)
-
-def sort_channels_by_recent(channels):
-    usage = load_usage()
-    def sort_key(ch):
-        ts = usage.get(ch["name"], "")
-        return ts if ts else "0"
-    return sorted(channels, key=sort_key, reverse=True)
+def record_usage(name):
+    supabase.table("channels").update({"last_used": datetime.now().isoformat()}).eq("name", name).execute()
 
 # ── Gemini analysis ──────────────────────────────────────────────────────────
-def analyze_video(video_bytes, filename, channel):
-    model = genai.GenerativeModel("gemini-1.5-flash")
+def analyze_video_with_progress(video_bytes, filename, channel, progress, status):
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
 
+    uploaded = None
     try:
+        # Step 1: Upload (10% → 40%)
         uploaded = genai.upload_file(tmp_path)
+        progress.progress(40)
 
-        # Wait for processing
+        # Step 2: Wait for Gemini processing (40% → 70%)
+        status.info("⚙️ Bước 2/4 — Gemini đang xử lý video...")
+        wait_steps = 0
         while uploaded.state.name == "PROCESSING":
-            time.sleep(2)
+            time.sleep(3)
             uploaded = genai.get_file(uploaded.name)
+            wait_steps += 1
+            pct = min(70, 40 + wait_steps * 5)
+            progress.progress(pct)
 
+        progress.progress(70)
+
+        # Step 3: AI analyze (70% → 95%)
+        status.info("🤖 Bước 3/4 — AI đang phân tích nội dung và tạo đề xuất...")
         platform = channel.get("platform", "")
         context = channel.get("context", "")
         lang = channel.get("language", "Tiếng Việt")
@@ -84,19 +83,22 @@ Hãy xem video này và phân tích nội dung, sau đó tạo ra:
 
 5. **Gợi ý thêm** (hook đầu video, CTA, thời điểm đăng tốt)
 
-Ngôn ngữ output: {lang}
-
-Trả lời theo đúng format 5 mục trên."""
+Ngôn ngữ output: {lang}"""
 
         response = model.generate_content([uploaded, prompt])
+        progress.progress(95)
+
+        # Step 4: Done
+        status.info("📝 Bước 4/4 — Đang hoàn thiện kết quả...")
         return response.text
 
     finally:
         os.unlink(tmp_path)
-        try:
-            genai.delete_file(uploaded.name)
-        except:
-            pass
+        if uploaded:
+            try:
+                genai.delete_file(uploaded.name)
+            except:
+                pass
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 def main():
@@ -118,15 +120,12 @@ def main():
             )
             if st.button("✅ Thêm", type="primary"):
                 if new_name and new_context:
-                    channels.append({
-                        "name": new_name,
-                        "platform": new_platform,
-                        "language": new_lang,
-                        "context": new_context
-                    })
-                    save_channels(channels)
-                    st.success(f"Đã thêm: {new_name}")
-                    st.rerun()
+                    try:
+                        add_channel(new_name, new_platform, new_lang, new_context)
+                        st.success(f"Đã thêm: {new_name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Lỗi: {e}")
                 else:
                     st.error("Nhập đủ tên và context nhé")
 
@@ -135,8 +134,7 @@ def main():
             st.subheader("🗑️ Xóa channel")
             del_name = st.selectbox("Chọn channel để xóa", [ch["name"] for ch in channels], key="del_select")
             if st.button("Xóa", type="secondary"):
-                channels = [ch for ch in channels if ch["name"] != del_name]
-                save_channels(channels)
+                delete_channel(del_name)
                 st.success(f"Đã xóa: {del_name}")
                 st.rerun()
 
@@ -148,27 +146,22 @@ def main():
         st.info("👈 Chưa có channel nào. Thêm channel mới ở sidebar để bắt đầu.")
         return
 
-    # Sort by recent usage
-    sorted_channels = sort_channels_by_recent(channels)
-    usage = load_usage()
-
-    # Recent bar
-    recent_channels = [ch for ch in sorted_channels if ch["name"] in usage][:4]
-    if recent_channels:
+    # Recent bar (channels đã dùng, sort theo last_used)
+    recent = [ch for ch in channels if ch.get("last_used")][:4]
+    if recent:
         st.markdown("**🔥 Gần đây:**")
-        cols = st.columns(len(recent_channels))
-        for i, ch in enumerate(recent_channels):
+        cols = st.columns(len(recent))
+        for i, ch in enumerate(recent):
             with cols[i]:
-                if st.button(f"{ch['platform']} · {ch['name']}", key=f"recent_{ch['name']}"):
-                    st.session_state["selected_channel"] = ch["name"]
+                st.button(f"{ch['platform']} · {ch['name']}", key=f"recent_{ch['name']}", disabled=True)
 
     st.divider()
 
-    # Channel tabs
-    tab_labels = [f"{ch['platform']} · {ch['name']}" for ch in sorted_channels]
+    # Channel tabs (sorted by last_used, nulls last)
+    tab_labels = [f"{ch['platform']} · {ch['name']}" for ch in channels]
     tabs = st.tabs(tab_labels)
 
-    for i, (tab, channel) in enumerate(zip(tabs, sorted_channels)):
+    for tab, channel in zip(tabs, channels):
         with tab:
             st.markdown(f"**Platform:** {channel['platform']} &nbsp;|&nbsp; **Output:** {channel.get('language','Tiếng Việt')}")
             with st.expander("📋 Context kênh"):
@@ -187,25 +180,31 @@ def main():
 
                 if st.button("🚀 Phân tích & Tạo content", type="primary", key=f"analyze_{channel['name']}"):
                     record_usage(channel["name"])
-                    with st.spinner("⏳ Đang upload và phân tích video... (có thể mất 30-60 giây)"):
-                        try:
-                            result = analyze_video(
-                                uploaded_file.getvalue(),
-                                uploaded_file.name,
-                                channel
-                            )
-                            st.success("✅ Xong!")
-                            st.markdown("---")
-                            st.markdown(result)
-
-                            st.download_button(
-                                "💾 Tải kết quả (.txt)",
-                                data=result,
-                                file_name=f"content_{channel['name']}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
-                                mime="text/plain"
-                            )
-                        except Exception as e:
-                            st.error(f"Lỗi: {str(e)}")
+                    progress = st.progress(0)
+                    status = st.empty()
+                    try:
+                        status.info("📤 Bước 1/4 — Đang upload video lên Gemini...")
+                        progress.progress(10)
+                        result = analyze_video_with_progress(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name,
+                            channel,
+                            progress,
+                            status
+                        )
+                        progress.progress(100)
+                        status.success("✅ Hoàn thành!")
+                        st.markdown("---")
+                        st.markdown(result)
+                        st.download_button(
+                            "💾 Tải kết quả (.txt)",
+                            data=result,
+                            file_name=f"content_{channel['name']}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                            mime="text/plain"
+                        )
+                    except Exception as e:
+                        progress.empty()
+                        status.error(f"❌ Lỗi: {str(e)}")
 
 if __name__ == "__main__":
     main()
