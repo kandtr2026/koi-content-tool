@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import time
 import tempfile
+import threading
 from datetime import datetime
 import google.generativeai as genai
 from supabase import create_client
@@ -45,8 +46,36 @@ def analyze_video_with_progress(video_bytes, filename, channel, progress, status
 
     uploaded = None
     try:
-        # Step 1: Upload (10% → 40%)
-        uploaded = genai.upload_file(tmp_path)
+        # Step 1: Upload với progress estimate theo file size (10% → 40%)
+        file_mb = len(video_bytes) / (1024 * 1024)
+        # Estimate ~3 MB/s upload speed → tổng giây upload
+        estimated_seconds = max(5, file_mb / 3)
+
+        result_holder = [None]
+        error_holder = [None]
+
+        def do_upload():
+            try:
+                result_holder[0] = genai.upload_file(tmp_path)
+            except Exception as e:
+                error_holder[0] = e
+
+        upload_thread = threading.Thread(target=do_upload)
+        upload_thread.start()
+
+        elapsed = 0
+        while upload_thread.is_alive():
+            time.sleep(0.5)
+            elapsed += 0.5
+            pct = int(10 + min(28, (elapsed / estimated_seconds) * 28))
+            progress.progress(pct)
+            status.info(f"📤 Bước 1/4 — Đang upload lên Gemini... ({min(100, int(elapsed/estimated_seconds*100))}%  •  {file_mb:.0f} MB)")
+
+        upload_thread.join()
+        if error_holder[0]:
+            raise error_holder[0]
+
+        uploaded = result_holder[0]
         progress.progress(40)
 
         # Step 2: Wait for Gemini processing (40% → 70%)
