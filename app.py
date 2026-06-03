@@ -50,12 +50,20 @@ def analyze_video_with_progress(video_bytes, filename, channel, progress, status
         result_holder = [None]
         error_holder = [None]
 
+        mime_map = {
+            ".mp4": "video/mp4", ".mov": "video/quicktime",
+            ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
+            ".webm": "video/webm"
+        }
+        ext = os.path.splitext(filename)[1].lower()
+        mime_type = mime_map.get(ext, "video/mp4")
+
         def do_upload():
             try:
                 with open(tmp_path, "rb") as f:
                     result_holder[0] = client.files.upload(
                         file=f,
-                        config=types.UploadFileConfig(display_name=filename)
+                        config=types.UploadFileConfig(display_name=filename, mime_type=mime_type)
                     )
             except Exception as e:
                 error_holder[0] = e
