@@ -1,0 +1,5 @@
+channels.json
+usage_log.json
+__pycache__/
+*.pyc
+.env
