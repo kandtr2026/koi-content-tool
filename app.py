@@ -4,7 +4,8 @@ import time
 import tempfile
 import threading
 from datetime import datetime
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from supabase import create_client
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -12,7 +13,7 @@ GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="Content Tool", page_icon="🎬", layout="wide")
@@ -24,10 +25,8 @@ def load_channels():
 
 def add_channel(name, platform, language, context):
     supabase.table("channels").insert({
-        "name": name,
-        "platform": platform,
-        "language": language,
-        "context": context
+        "name": name, "platform": platform,
+        "language": language, "context": context
     }).execute()
 
 def delete_channel(name):
@@ -38,17 +37,14 @@ def record_usage(name):
 
 # ── Gemini analysis ──────────────────────────────────────────────────────────
 def analyze_video_with_progress(video_bytes, filename, channel, progress, status):
-    model = genai.GenerativeModel("gemini-2.0-flash")
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
 
     uploaded = None
     try:
-        # Step 1: Upload với progress estimate theo file size (10% → 40%)
+        # Step 1: Upload với progress estimate (10% → 40%)
         file_mb = len(video_bytes) / (1024 * 1024)
-        # Estimate ~3 MB/s upload speed → tổng giây upload
         estimated_seconds = max(5, file_mb / 3)
 
         result_holder = [None]
@@ -56,7 +52,11 @@ def analyze_video_with_progress(video_bytes, filename, channel, progress, status
 
         def do_upload():
             try:
-                result_holder[0] = genai.upload_file(tmp_path)
+                with open(tmp_path, "rb") as f:
+                    result_holder[0] = client.files.upload(
+                        file=f,
+                        config=types.UploadFileConfig(display_name=filename)
+                    )
             except Exception as e:
                 error_holder[0] = e
 
@@ -69,7 +69,7 @@ def analyze_video_with_progress(video_bytes, filename, channel, progress, status
             elapsed += 0.5
             pct = int(10 + min(28, (elapsed / estimated_seconds) * 28))
             progress.progress(pct)
-            status.info(f"📤 Bước 1/4 — Đang upload lên Gemini... ({min(100, int(elapsed/estimated_seconds*100))}%  •  {file_mb:.0f} MB)")
+            status.info(f"📤 Bước 1/4 — Đang upload lên Gemini... ({min(99, int(elapsed/estimated_seconds*100))}%  •  {file_mb:.0f} MB)")
 
         upload_thread.join()
         if error_holder[0]:
@@ -81,9 +81,10 @@ def analyze_video_with_progress(video_bytes, filename, channel, progress, status
         # Step 2: Wait for Gemini processing (40% → 70%)
         status.info("⚙️ Bước 2/4 — Gemini đang xử lý video...")
         wait_steps = 0
-        while uploaded.state.name == "PROCESSING":
+        file_info = client.files.get(name=uploaded.name)
+        while file_info.state.name == "PROCESSING":
             time.sleep(3)
-            uploaded = genai.get_file(uploaded.name)
+            file_info = client.files.get(name=uploaded.name)
             wait_steps += 1
             pct = min(70, 40 + wait_steps * 5)
             progress.progress(pct)
@@ -114,10 +115,15 @@ Hãy xem video này và phân tích nội dung, sau đó tạo ra:
 
 Ngôn ngữ output: {lang}"""
 
-        response = model.generate_content([uploaded, prompt])
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Part.from_uri(file_uri=file_info.uri, mime_type=file_info.mime_type),
+                prompt
+            ]
+        )
         progress.progress(95)
 
-        # Step 4: Done
         status.info("📝 Bước 4/4 — Đang hoàn thiện kết quả...")
         return response.text
 
@@ -125,7 +131,7 @@ Ngôn ngữ output: {lang}"""
         os.unlink(tmp_path)
         if uploaded:
             try:
-                genai.delete_file(uploaded.name)
+                client.files.delete(name=uploaded.name)
             except:
                 pass
 
@@ -133,7 +139,6 @@ Ngôn ngữ output: {lang}"""
 def main():
     channels = load_channels()
 
-    # Sidebar: Admin panel
     with st.sidebar:
         st.header("⚙️ Quản lý Channels")
 
@@ -143,9 +148,8 @@ def main():
             new_lang = st.selectbox("Ngôn ngữ output", ["Tiếng Việt", "English", "Cả hai"], key="new_lang")
             new_context = st.text_area(
                 "Context / Tone của kênh",
-                placeholder="VD: Kênh về đồ da handmade, tone chuyên nghiệp nhưng gần gũi, target khách hàng 25-40 tuổi...",
-                key="new_context",
-                height=120
+                placeholder="VD: Kênh về đồ da handmade, tone chuyên nghiệp nhưng gần gũi, target 25-40 tuổi...",
+                key="new_context", height=120
             )
             if st.button("✅ Thêm", type="primary"):
                 if new_name and new_context:
@@ -167,7 +171,6 @@ def main():
                 st.success(f"Đã xóa: {del_name}")
                 st.rerun()
 
-    # Main area
     st.title("🎬 Content Tool")
     st.caption("Upload video → AI phân tích → Gợi ý Title, Hashtag, SEO")
 
@@ -175,7 +178,6 @@ def main():
         st.info("👈 Chưa có channel nào. Thêm channel mới ở sidebar để bắt đầu.")
         return
 
-    # Recent bar (channels đã dùng, sort theo last_used)
     recent = [ch for ch in channels if ch.get("last_used")][:4]
     if recent:
         st.markdown("**🔥 Gần đây:**")
@@ -186,7 +188,6 @@ def main():
 
     st.divider()
 
-    # Channel tabs (sorted by last_used, nulls last)
     tab_labels = [f"{ch['platform']} · {ch['name']}" for ch in channels]
     tabs = st.tabs(tab_labels)
 
@@ -209,17 +210,13 @@ def main():
 
                 if st.button("🚀 Phân tích & Tạo content", type="primary", key=f"analyze_{channel['name']}"):
                     record_usage(channel["name"])
-                    progress = st.progress(0)
+                    progress = st.progress(10)
                     status = st.empty()
                     try:
-                        status.info("📤 Bước 1/4 — Đang upload video lên Gemini...")
-                        progress.progress(10)
                         result = analyze_video_with_progress(
                             uploaded_file.getvalue(),
                             uploaded_file.name,
-                            channel,
-                            progress,
-                            status
+                            channel, progress, status
                         )
                         progress.progress(100)
                         status.success("✅ Hoàn thành!")
